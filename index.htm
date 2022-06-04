@@ -1,0 +1,31 @@
+<!doctype html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCH2022 WebUSB</title>
+  <meta name="description" content="MCH2022 WebUSB">
+  <meta name="author" content="BADGE.TEAM">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="xterm.css">
+</head>
+
+<body>
+  <div class="box">
+    <div class="row header">
+      <strong>MCH2022</strong> WebUSB<br />
+      <div id="tabs"></div>
+    </div>
+    <div class="row content" id="terminal_debug"></div>
+    <div class="row content" id="terminal_esp32"></div>
+    <div class="row content" id="terminal_fpga"></div>
+    <div class="row footer">
+      <div id="app">MCH2022 WebUSB tool<br />Javascript application is starting...</div>
+    </div>
+  </div>
+  <script src="xterm.js"></script>
+  <script src="xterm_helper.js"></script>
+  <script src="webusb.js"></script>
+</body>
+</html>
