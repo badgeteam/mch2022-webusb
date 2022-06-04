@@ -5,8 +5,10 @@ var interfaces = [];
 var terminal_debug = null;
 var terminal_esp32 = null;
 var terminal_fpga = null;
+var bitstream_state = false;
+var bitstream_process_state = 0;
 
-function show_connect() {
+function onStart() {
     document.getElementById("app").innerHTML = "<button type='button' id='connect'>Connect</button>";
     let connectButton = document.getElementById("connect");
     connectButton.onclick = async () => {
@@ -24,12 +26,16 @@ async function open_device() {
     document.getElementById("app").innerHTML = "Connecting to device...";
     await device.open();
     await device.selectConfiguration(1);
-    await show_information();
+    await onConnect();
 }
 
-async function show_information() {
-    let output = "<pre>";
-    output += "Connected to " + device.manufacturerName + " " + device.productName + " with unique identifier " + device.serialNumber + "\n";
+async function onConnect() {
+    let output = "Connected to " + device.manufacturerName + " " + device.productName + " with unique identifier " + device.serialNumber;
+    output += "<button type='button' id='disconnect'>Disconnect</button>";
+    //output += "<button type='button' id='reset_esp32_dl' onclick='resetEsp32(1, true);'>Reset ESP32 to DL</button>";
+    output += "<button type='button' id='reset_esp32_app' onclick='resetEsp32ToWebUSB(1, 0x00);'>Normal mode</button>";
+    output += "<button type='button' id='reset_esp32_webusb_enter' onclick='resetEsp32ToWebUSB(1, 0x01);'>WebUSB mode</button>";
+    output += "<button type='button' id='reset_esp32_webusb_leave' onclick='resetEsp32ToWebUSB(1, 0x02);'>FPGA download mode</button>";
     
     // Claim all vendor interfaces
     interfaces = [];
@@ -59,11 +65,12 @@ async function show_information() {
     }
     
     for (let ifIndex = 0; ifIndex < interfaces.length; ifIndex++) {
-        sendState(ifIndex, true);
+        sendState(ifIndex, 0x0001);
         listen(ifIndex);
-        output += "<button type='button' onclick='sendState(" + ifIndex + ", true);'>" + ifIndex + " ON</button>";
-        output += "<button type='button' onclick='sendState(" + ifIndex + ", false);'>" + ifIndex + " OFF</button>";
     }
+    
+    setBaudrate(1, 115200); // Set ESP32 UART to 115200 baud
+    setBaudrate(2, 1000000); // Set FPGA UART to 1000000 baud
 
     document.getElementById("app").innerHTML = output;
 }
@@ -81,7 +88,55 @@ async function sendControl(ifIndex, request, value) {
 }
 
 async function sendState(ifIndex, state) {
-    return sendControl(ifIndex, 0x22, state ? 0x01 : 0x00);
+    return sendControl(ifIndex, 0x22, state);
+}
+
+async function resetEsp32(ifIndex, bootloader_mode = false) {
+    return sendControl(ifIndex, 0x23, bootloader_mode ? 0x01 : 0x00);
+}
+
+async function setBaudrate(ifIndex, baudrate) {
+    return sendControl(ifIndex, 0x24, Math.floor(baudrate / 100));
+}
+
+async function setMode(ifIndex, mode) {
+    return sendControl(ifIndex, 0x25, mode);
+}
+
+async function resetEsp32ToWebUSB(ifIndex, webusb_mode = 0x00) {
+    await setMode(ifIndex, webusb_mode);
+    await setBaudrate(ifIndex, (webusb_mode > 0) ? 921600 : 115200);
+    await resetEsp32(ifIndex, false);
+    await setBitstreamMode(webusb_mode == 0x02);
+}
+
+async function setBitstreamMode(mode) {
+    if (bitstream_state == mode) return;
+    bitstream_state = mode;
+}
+
+async function bitstreamReceive(message) {
+    if (message == "FPGA") {
+        console.log("Bitstream ready for upload!");
+        bitstream_process_state = 1;
+    } else {
+        console.log("Bitstream unhandled:", message);
+        bitstream_process_state = 0;
+    }
+    
+    updateBitstreamUi();
+}
+
+async function updateBitstreamUi() {
+    let elem = document.getElementById("ui_bitstream");
+    
+    if (bitstream_process_state == 0) {
+        elem.innerHTML = "Device not ready";
+    } else if (bitstream_process_state == 1) {
+        elem.innerHTML = "Ready for upload";
+    } else {
+        elem.innerHTML = "Unknown process state " + bitstream_process_state;
+    }
 }
 
 async function listen(ifIndex) {
@@ -95,7 +150,11 @@ async function listen(ifIndex) {
         if (ifIndex == 0) {
             terminal_debug.write(message);
         } else if (ifIndex == 1) {
-            terminal_esp32.write(message);
+            if (bitstream_state) {
+                bitstreamReceive(message);
+            } else {
+                terminal_esp32.write(message);
+            }
         } else if (ifIndex == 2) {
             terminal_fpga.write(message);
         }
@@ -169,14 +228,16 @@ window.onload = () => {
     });
     
     initTabs([
-        {id: "terminal_debug", label: "Control (RP2040)", onSelect: fitTerm.bind(this, terminal_debug, "terminal_debug")},
-        {id: "terminal_esp32", label: "CPU (ESP32)", onSelect: fitTerm.bind(this, terminal_esp32, "terminal_esp32")},
-        {id: "terminal_fpga", label: "FPGA (ICE40)", onSelect: fitTerm.bind(this, terminal_fpga, "terminal_fpga")}
+        {id: "terminal_debug", label: "Terminal: Control (RP2040)", onSelect: fitTerm.bind(this, terminal_debug, "terminal_debug")},
+        {id: "terminal_esp32", label: "Terminal: CPU (ESP32)", onSelect: fitTerm.bind(this, terminal_esp32, "terminal_esp32")},
+        {id: "terminal_fpga", label: "Terminal: FPGA (ICE40)", onSelect: fitTerm.bind(this, terminal_fpga, "terminal_fpga")},
+        {id: "ui_webusb", label: "WebUSB UI", onSelect: () => {}},
+        {id: "ui_bitstream", label: "Bitstream UI", onSelect: () => {}},
     ]);
     
     fitTerm(terminal_debug, "terminal_debug");
     fitTerm(terminal_esp32, "terminal_esp32");
     fitTerm(terminal_fpga, "terminal_fpga");
     
-    show_connect();
+    onStart();
 };
