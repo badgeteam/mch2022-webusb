@@ -20,11 +20,13 @@
     <div class="row content" id="terminal_debug"></div>
     <div class="row content" id="terminal_esp32"></div>
     <div class="row content" id="ui_webusb"></div>
-    <div class="row content" id="ui_bitstream"></div>
+    <div class="row content" id="ui_bitstream">
+      Status: <span id="ui_bitstream_status"></span><br />
+      <input type='file' id='bitstream_file'><button type='button' onclick='uploadBitstream();' id='ui_bitstream_btn' disabled>Upload</button>
+    </div>
     <div class="row content" id="terminal_fpga"></div>
   </div>
   <script src="xterm.js"></script>
-  <script src="xterm_helper.js"></script>
   <script src="webusb.js"></script>
 </body>
 </html>
