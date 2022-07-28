@@ -33,9 +33,9 @@ async function onConnect() {
     let output = "Connected to " + device.manufacturerName + " " + device.productName + " with unique identifier " + device.serialNumber;
     output += "<button type='button' id='disconnect' onclick='disconnect();'>Disconnect</button>";
     //output += "<button type='button' id='reset_esp32_dl' onclick='resetEsp32(1, true);'>Reset ESP32 to DL</button>";
-    output += "<button type='button' id='reset_esp32_app' onclick='resetEsp32ToWebUSB(1, 0x00);'>Normal mode</button>";
-    output += "<button type='button' id='reset_esp32_webusb_enter' onclick='resetEsp32ToWebUSB(1, 0x01);'>WebUSB mode</button>";
-    output += "<button type='button' id='reset_esp32_webusb_leave' onclick='resetEsp32ToWebUSB(1, 0x02);'>FPGA download mode</button>";
+    output += "<button type='button' id='reset_esp32_app' onclick='resetEsp32ToWebUSB(0, 0x00);'>Normal mode</button>";
+    output += "<button type='button' id='reset_esp32_webusb_enter' onclick='resetEsp32ToWebUSB(0, 0x01);'>WebUSB mode</button>";
+    output += "<button type='button' id='reset_esp32_webusb_leave' onclick='resetEsp32ToWebUSB(0, 0x02);'>FPGA download mode</button>";
     
     // Claim all vendor interfaces
     interfaces = [];
@@ -69,8 +69,8 @@ async function onConnect() {
         listen(ifIndex);
     }
     
-    setBaudrate(1, 115200); // Set ESP32 UART to 115200 baud
-    setBaudrate(2, 1000000); // Set FPGA UART to 1000000 baud
+    setBaudrate(0, 115200); // Set ESP32 UART to 115200 baud
+    setBaudrate(1, 1000000); // Set FPGA UART to 1000000 baud
 
     document.getElementById("app").innerHTML = output;
 }
