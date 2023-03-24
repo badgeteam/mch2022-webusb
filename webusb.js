@@ -1,367 +1,449 @@
 "use strict";
 
-var device = null;
-var interfaces = [];
-var terminal_debug = null;
-var terminal_esp32 = null;
-var terminal_fpga = null;
-var bitstream_state = false;
-var bitstream_process_state = 0;
+class Badge {
+    constructor() {
+        this.text_encoder = new TextEncoder();
+        this.text_decoder = new TextDecoder();
 
-function onStart() {
-    document.getElementById("app").innerHTML = "<button type='button' id='connect'>Connect</button>";
-    let connectButton = document.getElementById("connect");
-    connectButton.onclick = async () => {
-        device = await navigator.usb.requestDevice({
-            filters: [{ vendorId: 0x16d0, productId: 0x0f9a }]
-        });
-        open_device().catch((error) => {
-            console.error(error);
-            document.getElementById("app").innerHTML = "Application crashed.";
+        this.filters = [
+            { vendorId: 0x16d0, productId: 0x0f9a } // MCH2022 badge
+        ];
+
+        // USB control transfer requests
+        this.REQUEST_STATE          = 0x22;
+        this.REQUEST_RESET          = 0x23;
+        this.REQUEST_BAUDRATE       = 0x24;
+        this.REQUEST_MODE           = 0x25;
+        this.REQUEST_MODE_GET       = 0x26;
+        this.REQUEST_FW_VERSION_GET = 0x27;
+
+        // ESP32 firmware boot modes
+        this.MODE_NORMAL        = 0x00;
+        this.MODE_WEBUSB_LEGACY = 0x01;
+        this.MODE_FPGA_DOWNLOAD = 0x02;
+        this.MODE_WEBUSB        = 0x03;
+
+        // Protocol
+        this.PROTOCOL_MAGIC                               = 0xFEEDF00D;
+        this.PROTOCOL_COMMAND_SYNC                        = new DataView(this.text_encoder.encode("SYNC").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_PING                        = new DataView(this.text_encoder.encode("PING").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_LIST             = new DataView(this.text_encoder.encode("FSLS").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_EXISTS           = new DataView(this.text_encoder.encode("FSEX").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_CREATE_DIRECTORY = new DataView(this.text_encoder.encode("FSMD").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_REMOVE           = new DataView(this.text_encoder.encode("FSRM").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_STATUS           = new DataView(this.text_encoder.encode("FSST").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_FILE_WRITE       = new DataView(this.text_encoder.encode("FSFW").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_FILE_READ        = new DataView(this.text_encoder.encode("FSFR").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_FILESYSTEM_FILE_CLOSE       = new DataView(this.text_encoder.encode("FSFC").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_TRANSFER_CHUNK              = new DataView(this.text_encoder.encode("CHNK").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_APP_LIST                    = new DataView(this.text_encoder.encode("APPL").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_APP_READ                    = new DataView(this.text_encoder.encode("APPR").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_APP_WRITE                   = new DataView(this.text_encoder.encode("APPW").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_APP_REMOVE                  = new DataView(this.text_encoder.encode("APPD").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_APP_RUN                     = new DataView(this.text_encoder.encode("APPX").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_CONFIGURATION_LIST          = new DataView(this.text_encoder.encode("NVSL").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_CONFIGURATION_READ          = new DataView(this.text_encoder.encode("NVSR").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_CONFIGURATION_WRITE         = new DataView(this.text_encoder.encode("NVSW").buffer).getUint32(0, true);
+        this.PROTOCOL_COMMAND_CONFIGURATION_REMOVE        = new DataView(this.text_encoder.encode("NVSD").buffer).getUint32(0, true);
+
+        this.interfaceIndex = 4; // Defined in the USB descriptor for MCH2022 badge, set to NULL to automatically find the first vendor interface
+
+        this.device = null;
+        this.endpoint_in = null;
+        this.endpoint_out = null;
+
+        this.data_buffer = new ArrayBuffer(0);
+
+        this.next_identifier = 0;
+        this.transaction_promises = {};
+        this.in_sync = false;
+
+        this.on_connection_lost = null;
+    }
+
+    _checkDeviceConnected() {
+        if (this.device === null) {
+            throw new Error("Not connected");
+        }
+    }
+
+    async _findInterfaceIndex(firstInterfaceIndex = 0) {
+        const USB_CLASS_VENDOR = 0xFF;
+        for (let index = firstInterfaceIndex; index < this.device.configuration.interfaces.length; index++) {
+            if (this.device.configuration.interfaces[index].alternate.interfaceClass == USB_CLASS_VENDOR) {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    async _findEndpoints() {
+        let endpoints = this.device.configuration.interfaces[this.interfaceIndex].alternate.endpoints;
+        for (let index = 0; index < endpoints.length; index++) {
+            if (endpoints[index].direction == "out") {
+                this.endpoint_out = endpoints[index];
+            }
+            if (endpoints[index].direction == "in") {
+                this.endpoint_in = endpoints[index];
+            }
+        }
+    }
+
+    async _controlTransferOut(request, value) {
+        await this.device.controlTransferOut({
+            requestType: 'class',
+            recipient: 'interface',
+            request: request,
+            value: value,
+            index: this.interfaceIndex
         });
     }
-}
 
-async function open_device() {
-    document.getElementById("app").innerHTML = "Connecting to device...";
-    await device.open();
-    await device.selectConfiguration(1);
-    await onConnect();
-}
+    async _controlTransferIn(request, length = 1) {
+        let result = await this.device.controlTransferIn({
+            requestType: 'class',
+            recipient: 'interface',
+            request: request,
+            value: 0,
+            index: this.interfaceIndex
+        }, length);
+        return result.data;
+    }
 
-async function onConnect() {
-    let output = "Connected to " + device.manufacturerName + " " + device.productName + " with unique identifier " + device.serialNumber;
-    output += "<button type='button' id='disconnect' onclick='disconnect();'>Disconnect</button>";
-    //output += "<button type='button' id='reset_esp32_dl' onclick='resetEsp32(1, true);'>Reset ESP32 to DL</button>";
-    output += "<button type='button' id='reset_esp32_app' onclick='resetEsp32ToWebUSB(1, 0x00);'>Normal mode</button>";
-    output += "<button type='button' id='reset_esp32_webusb_enter' onclick='resetEsp32ToWebUSB(1, 0x01);'>WebUSB mode</button>";
-    output += "<button type='button' id='reset_esp32_webusb_leave' onclick='resetEsp32ToWebUSB(1, 0x02);'>FPGA download mode</button>";
-    
-    // Claim all vendor interfaces
-    interfaces = [];
-    for (let index = 0; index < device.configuration.interfaces.length; index++) {
-        const CLASS_VENDOR = 0xFF;
-        if (device.configuration.interfaces[index].alternate.interfaceClass == CLASS_VENDOR) {
-            console.log("Claim interface " + index);
-            await device.claimInterface(index);
-            let endpoints = device.configuration.interfaces[index].alternate.endpoints;
-            let epOut = null;
-            let epIn = null;
-            for (let epIndex = 0; epIndex < endpoints.length; epIndex++) {
-                if (endpoints[epIndex].direction == "out") {
-                    epOut = endpoints[epIndex];
-                }
-                if (endpoints[epIndex].direction == "in") {
-                    epIn = endpoints[epIndex];
-                }
+    async _dataTransferOut(data) {
+        await this.device.transferOut(this.endpoint_out.endpointNumber, data);
+    }
+
+    async _dataTransferIn(amount) {
+        let result = await this.device.transferIn(this.endpoint_in.endpointNumber, 8192 + 20);
+        return result.data;
+    }
+
+    _concatBuffers(buffers = []) {
+        let total_length = 0;
+        for (let i = 0; i < buffers.length; i++) {
+            total_length += buffers[i].byteLength;
+        }
+        var tmp = new Uint8Array(total_length);
+        let offset = 0;
+        for (let i = 0; i < buffers.length; i++) {
+            if (buffers[i].byteLength === 0) continue;
+            tmp.set(new Uint8Array(buffers[i]), offset);
+            offset += buffers[i].byteLength;
+        }
+        return tmp.buffer;
+    }
+
+    async _sendPacket(identifier, command, payload = new ArrayBuffer()) {
+        let header = new ArrayBuffer(20);
+        let dataView = new DataView(header);
+        dataView.setUint32(0, this.PROTOCOL_MAGIC, true);
+        dataView.setUint32(4, identifier, true);
+        dataView.setUint32(8, command, true);
+        dataView.setUint32(12, payload.length, true);
+        dataView.setUint32(16, payload.length > 0 ? crc32FromArrayBuffer(payload) : 0, true);
+        let packet = this._concatBuffers([header, payload]);
+        await this._dataTransferOut(packet);
+    }
+
+    _createTransactionPromise() {
+        let promiseResolve, promiseReject;
+        let promise = new Promise((resolve, reject) => {
+            promiseResolve = resolve;
+            promiseReject = reject;
+        });
+        return {
+            promise: promise,
+            resolve: promiseResolve,
+            reject: promiseReject,
+            result: null,
+            error: null,
+            response: null,
+            response_text: null,
+            timeout: null
+        };
+    }
+
+    async _transaction(command, payload = new ArrayBuffer(), timeout = 0) {
+        let transaction = this._createTransactionPromise();
+        let identifier = this.next_identifier;
+        this.transaction_promises[identifier] = transaction;
+        this.next_identifier = (this.next_identifier + 1) & 0xFFFFFFFF;
+        if (timeout > 0) {
+            transaction.timeout = setTimeout(() => {
+                transaction.error = new Error("timeout");
+                transaction.reject();
+                delete this.transaction_promises[identifier];
+                this.in_sync = false;
+            }, timeout);
+        }
+        await this._sendPacket(identifier, command, payload);
+        try {
+            await transaction.promise;
+            if (transaction.response !== command) {
+                console.error("Badge reports error " + transaction.response_text);
+                throw new Error("Error response " + transaction.response_text);
+            } else {
+                return transaction.result;
             }
-            interfaces.push({
-                index: index,
-                interface: device.configuration.interfaces[index],
-                epIn: epIn,
-                epOut: epOut
+        } catch (error) {
+            throw transaction.error;
+        }
+    }
+
+    async _handleData(new_buffer) {
+        this.data_buffer = this._concatBuffers([this.data_buffer, new_buffer]);
+
+        while (this.data_buffer.byteLength >= 20) {
+            let dataView = new DataView(this.data_buffer);
+            let magic = dataView.getUint32(0, true);
+            if (magic == this.PROTOCOL_MAGIC) {
+                let dataView = new DataView(this.data_buffer);
+                let magic = dataView.getUint32(0, true);
+                if (magic == this.PROTOCOL_MAGIC) {
+                    let payload_length = dataView.getUint32(12, true);
+                    if (this.data_buffer.byteLength >= 20 + payload_length) {
+                        await this._handlePacket(this.data_buffer.slice(0, 20 + payload_length));
+                        this.data_buffer = this.data_buffer.slice(20 + payload_length);
+                    } else {
+                        return; // Wait for more data
+                    }
+                }
+            } else {
+                this.data_buffer = this.data_buffer.slice(1); // Shift buffer
+            }
+        }
+    }
+
+    async _handlePacket(buffer) {
+        let dataView = new DataView(buffer);
+        let magic = dataView.getUint32(0, true);
+        let identifier = dataView.getUint32(4, true);
+        let response = dataView.getUint32(8, true);
+        let payload_length = dataView.getUint32(12, true);
+        let payload_crc = dataView.getUint32(16, true);
+        let payload = null;
+        if (payload_length > 0) {
+            payload = buffer.slice(20);
+            if (crc32FromArrayBuffer(payload) !== payload_crc) {
+                if (identifier in this.transaction_promises) {
+                    if (this.transaction_promises[identifier].timeout !== null) {
+                        clearTimeout(this.transaction_promises[identifier].timeout);
+                    }
+                    this.transaction_promises[identifier].response = response;
+                    this.transaction_promises[identifier].response_text = this.text_decoder.decode(new Uint8Array(buffer.slice(8,12)));
+                    this.transaction_promises[identifier].error = new Error("crc");
+                    this.transaction_promises[identifier].reject();
+                    delete this.transaction_promises[identifier];
+                } else {
+                    console.error("Found no transaction for", identifier, response);
+                }
+                return;
+            }
+        }
+        if (identifier in this.transaction_promises) {
+            if (this.transaction_promises[identifier].timeout !== null) {
+                clearTimeout(this.transaction_promises[identifier].timeout);
+            }
+            this.transaction_promises[identifier].response = response;
+            this.transaction_promises[identifier].response_text = this.text_decoder.decode(new Uint8Array(buffer.slice(8,12)));
+            this.transaction_promises[identifier].result = payload;
+            this.transaction_promises[identifier].resolve();
+            delete this.transaction_promises[identifier];
+        } else {
+            console.error("Found no transaction for", identifier, response);
+        }
+    }
+
+    async _listen() {
+        if (this.listening) return;
+        this.listening = true;
+        try {
+            while (this.listening) {
+                let result = await this._dataTransferIn();
+                if (!this.listening) break;
+                await this._handleData(result.buffer);
+            }
+        } catch (error) {
+            this.listening = false;
+            if (this.on_connection_lost !== null) {
+                this.on_connection_lost();
+            }
+        }
+    }
+
+    async _stopListening() {
+        if (!this.listening) return;
+        this.listening = false;
+        await this._sendPacket(0, this.PROTOCOL_COMMAND_SYNC);
+    }
+
+    setOnConnectionLostCallback(callback) {
+        this.on_connection_lost = callback;
+    }
+
+    async connect() {
+        if (this.device !== null) {
+            throw new Error("Already connected");
+        }
+        this.device = await navigator.usb.requestDevice({
+            filters: this.filters
+        });
+        await this.device.open();
+        await this.device.selectConfiguration(1);
+        if (this.interfaceIndex === null) { // Optional automatic discovery of the interface index
+            this.interfaceIndex = await this._findInterfaceIndex();
+        }
+        await this.device.claimInterface(this.interfaceIndex);
+        await this._findEndpoints();
+
+        await this.controlSetState(true);
+        await this.controlSetBaudrate(921600);
+
+        let currentMode = await this.controlGetMode();
+        if (currentMode != this.MODE_WEBUSB) {
+            await this.controlSetMode(this.MODE_WEBUSB);
+            await this.controlReset(false);
+        }
+
+        this._listen();
+
+        let protocol_version = false;
+        while (!protocol_version) {
+            protocol_version = await this.sync();
+        }
+
+        if (protocol_version < 1) {
+            throw new Error("Protocol version not supported");
+        }
+    }
+
+    async disconnect() {
+        this._checkDeviceConnected();
+        try {
+            this._stopListening();
+            await this.controlSetMode(this.MODE_NORMAL);
+            await this.controlReset(false);
+            await this.controlSetState(false);
+            await this.device.releaseInterface(this.interfaceIndex);
+        } catch (error) {
+            // Ignore errors
+        }
+        await this.device.close();
+        this.next_identifier = 0;
+        this.transaction_callbacks = {};
+    }
+
+    getManufacturerName() {
+        this._checkDeviceConnected();
+        return this.device.manufacturerName;
+    }
+
+    getProductName() {
+        this._checkDeviceConnected();
+        return this.device.productName;
+    }
+
+    getSerialNumber() {
+        this._checkDeviceConnected();
+        return this.device.serialNumber;
+    }
+
+    async controlSetState(state) {
+        await this._controlTransferOut(this.REQUEST_STATE, state ? 0x0001 : 0x0000);
+    }
+
+    async controlReset(bootloader_mode = false) {
+        await this._controlTransferOut(this.REQUEST_RESET, bootloader_mode ? 0x01 : 0x00);
+    }
+
+    async controlSetBaudrate(baudrate) {
+        await this._controlTransferOut(this.REQUEST_BAUDRATE, Math.floor(baudrate / 100));
+    }
+
+    async controlSetMode(mode) {
+        await this._controlTransferOut(this.REQUEST_MODE, mode);
+    }
+
+    async controlGetMode() {
+        let result = await this._controlTransferIn(this.REQUEST_MODE_GET, 1);
+        return result.getUint8(0);
+    }
+
+    async controlGetFirmwareVersion() {
+        let result = await this._controlTransferIn(this.REQUEST_FW_VERSION_GET, 1);
+        return result.getUint8(0);
+    }
+
+    async sync() {
+        try {
+            let result = await this._transaction(this.PROTOCOL_COMMAND_SYNC, new ArrayBuffer(), 100);
+            this.in_sync = true;
+            return new DataView(result).getUint16(0, true);
+        } catch (error) {
+            return false;
+        }
+    }
+
+    async sync_if_needed() {
+        while (!this.in_sync) {
+            await this.sync();
+        }
+    }
+
+    async filesystem_list(path) {
+        await this.sync_if_needed();
+        let path_encoded = this.text_encoder.encode(path);
+        let data = await this._transaction(this.PROTOCOL_COMMAND_FILESYSTEM_LIST, path_encoded, 1000);
+        let result = [];
+        while (data.byteLength > 0) {
+            let dataView = new DataView(data);
+            let item_type = dataView.getUint8(0, true);
+            let item_name_length = dataView.getUint32(1, true);
+            let item_name = this.text_decoder.decode(data.slice(5, 5 + item_name_length));
+            data = data.slice(5 + item_name_length);
+            dataView = new DataView(data);
+            let stat_res = dataView.getInt32(0, true);
+            let item_size = dataView.getUint32(4, true);
+            let item_modified = dataView.getBigUint64(8, true);
+            data = data.slice(16);
+            result.push({
+                type: item_type === 2 ? "dir" : "file",
+                name: item_name,
+                stat: stat_res === 0 ? {
+                    size: item_size,
+                    modified: item_modified
+                } : null
             });
         }
+        return result;
     }
-    
-    for (let ifIndex = 0; ifIndex < interfaces.length; ifIndex++) {
-        sendState(ifIndex, 0x0001);
-        listen(ifIndex);
-    }
-    
-    setBaudrate(1, 115200); // Set ESP32 UART to 115200 baud
-    setBaudrate(2, 1000000); // Set FPGA UART to 1000000 baud
 
-    document.getElementById("app").innerHTML = output;
-}
-
-async function sendControl(ifIndex, request, value) {
-    let endpoint = interfaces[ifIndex].epOut;
-    return device.controlTransferOut({
-        requestType: 'class',
-        recipient: 'interface',
-        request: request,
-        value: value,
-        index: interfaces[ifIndex].index}).then(result => {
-        console.log(endpoint.endpointNumber, result);
-    });
-}
-
-async function sendState(ifIndex, state) {
-    return sendControl(ifIndex, 0x22, state);
-}
-
-async function resetEsp32(ifIndex, bootloader_mode = false) {
-    return sendControl(ifIndex, 0x23, bootloader_mode ? 0x01 : 0x00);
-}
-
-async function setBaudrate(ifIndex, baudrate) {
-    console.log("Baudrate for " + ifIndex + " set to " + baudrate);
-    return sendControl(ifIndex, 0x24, Math.floor(baudrate / 100));
-}
-
-async function setMode(ifIndex, mode) {
-    return sendControl(ifIndex, 0x25, mode);
-}
-
-async function resetEsp32ToWebUSB(ifIndex, webusb_mode = 0x00) {
-    await setMode(ifIndex, webusb_mode);
-    await new Promise(r => setTimeout(r, 50));
-    await resetEsp32(ifIndex, false);
-    await new Promise(r => setTimeout(r, 50));
-    await setBaudrate(ifIndex, 115200);
-    await new Promise(r => setTimeout(r, 50));
-    await setBitstreamMode(0);
-    if (webusb_mode > 0) {
-        setTimeout(async () => {
-            await setBaudrate(ifIndex, 921600);
-            await new Promise(r => setTimeout(r, 50));
-            await setBaudrate(ifIndex, 921600);
-            await setBitstreamMode(webusb_mode == 0x02);
-        }, 3000);
-    }
-}
-
-async function setBitstreamMode(mode) {
-    if (bitstream_state == mode) return;
-    bitstream_state = mode;
-}
-
-let bitstreamReceiveBuffer = "";
-async function bitstreamReceive(newMessage) {
-    bitstreamReceiveBuffer += newMessage;
-    for (let index = 0; bitstreamReceiveBuffer.length - index >= 4; index++) {
-        let data = bitstreamReceiveBuffer.slice(index,4 + index);
-        if (data == "FPGA") {
-            console.log("Bitstream ready for upload!");
-            bitstream_process_state = 1;
-            index+=3;
-        } else {
-            console.log("Bitstream unhandled:", data);
-            bitstream_process_state = 0;
+    async configuration_list(namespace = "") {
+        await this.sync_if_needed();
+        let namespace_encoded = this.text_encoder.encode(namespace);
+        let data = await this._transaction(this.PROTOCOL_COMMAND_CONFIGURATION_LIST, namespace_encoded, 1000);
+        let result = [];
+        while (data.byteLength > 0) {
+            let dataView = new DataView(data);
+            let namespace_length = dataView.getUint16(0, true);
+            let namespace = this.text_decoder.decode(data.slice(2, 2 + namespace_length));
+            data = data.slice(2 + namespace_length);
+            dataView = new DataView(data);
+            let key_length = dataView.getUint16(0, true);
+            let key = this.text_decoder.decode(data.slice(2, 2 + key_length));
+            data = data.slice(2 + key_length);
+            dataView = new DataView(data);
+            let type = dataView.getUint8(0);
+            let size = dataView.getUint32(0, true);
+            data = data.slice(5);
+            result.push({
+                namespace: namespace,
+                key: key,
+                type: type,
+                size: size
+            });
         }
-    }
-    bitstreamReceiveBuffer = bitstreamReceiveBuffer.slice(-3);
-    updateBitstreamUi();
-}
-
-async function updateBitstreamUi() {
-    let elem = document.getElementById("ui_bitstream_status");
-    let btn = document.getElementById("ui_bitstream_btn");
-    
-    if (bitstream_process_state == 0) {
-        elem.innerHTML = "Device not ready";
-        btn.disabled = true;
-    } else if (bitstream_process_state == 1) {
-        elem.innerHTML = "Ready for upload";
-        btn.disabled = false;
-    } else {
-        elem.innerHTML = "Unknown process state " + bitstream_process_state;
-        btn.disabled = true;
+        return result;
     }
 }
-
-function crc32FromArrayBuffer(dsArr) {
-    var table = new Uint32Array([
-        0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
-        0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,
-        0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91, 0x1db71064, 0x6ab020f2,
-        0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
-        0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9,
-        0xfa0f3d63, 0x8d080df5, 0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172,
-        0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b, 0x35b5a8fa, 0x42b2986c,
-        0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
-        0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423,
-        0xcfba9599, 0xb8bda50f, 0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924,
-        0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d, 0x76dc4190, 0x01db7106,
-        0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
-        0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d,
-        0x91646c97, 0xe6635c01, 0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e,
-        0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457, 0x65b0d9c6, 0x12b7e950,
-        0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
-        0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7,
-        0xa4d1c46d, 0xd3d6f4fb, 0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0,
-        0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9, 0x5005713c, 0x270241aa,
-        0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
-        0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81,
-        0xb7bd5c3b, 0xc0ba6cad, 0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a,
-        0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683, 0xe3630b12, 0x94643b84,
-        0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
-        0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb,
-        0x196c3671, 0x6e6b06e7, 0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc,
-        0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5, 0xd6d6a3e8, 0xa1d1937e,
-        0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
-        0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55,
-        0x316e8eef, 0x4669be79, 0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236,
-        0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f, 0xc5ba3bbe, 0xb2bd0b28,
-        0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
-        0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f,
-        0x72076785, 0x05005713, 0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38,
-        0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21, 0x86d3d2d4, 0xf1d4e242,
-        0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
-        0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69,
-        0x616bffd3, 0x166ccf45, 0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2,
-        0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db, 0xaed16a4a, 0xd9d65adc,
-        0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
-        0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693,
-        0x54de5729, 0x23d967bf, 0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94,
-        0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
-    ]);
-    var crc = 0 ^ (-1);
-    for(var i = 0; i < dsArr.byteLength; i++) {
-        crc = (crc >>> 8) ^ table[(crc ^ dsArr[i]) & 0xFF];
-    }
-    return (crc ^ (-1)) >>> 0;
-}
-
-async function uploadBitstream() {
-    let elem = document.getElementById("ui_bitstream_status");
-    let btn = document.getElementById("ui_bitstream_btn");
-    let file_input = document.getElementById("bitstream_file");
-    elem.innerHTML = "Reading file...";
-    btn.disabled = true;
-    let file = file_input.files[0];
-    if (typeof file !== "object") {
-        elem.innerHTML = "No file selected or failed to open file";
-        return;
-    }
-    let reader = new FileReader();
-    reader.readAsArrayBuffer(new Blob([file]));
-    reader.onload = async () => {
-        elem.innerHTML = "Uploading...";
-        btn.disabled = true;
-        let bitstream = new Uint8Array(reader.result);
-        let file_size = bitstream.byteLength;
-        let file_size_uint32 = new Uint8Array(4);
-        file_size_uint32[3] = (file_size >> 24) & 0xFF;
-        file_size_uint32[2] = (file_size >> 16) & 0xFF;
-        file_size_uint32[1] = (file_size >>  8) & 0xFF;
-        file_size_uint32[0] = (file_size >>  0) & 0xFF;
-        let crc32 = crc32FromArrayBuffer(bitstream);
-        let crc32_uint32 = new Uint8Array(4);
-        crc32_uint32[3] = (crc32 >> 24) & 0xFF;
-        crc32_uint32[2] = (crc32 >> 16) & 0xFF;
-        crc32_uint32[1] = (crc32 >>  8) & 0xFF;
-        crc32_uint32[0] = (crc32 >>  0) & 0xFF;
-        console.log("File size", file_size, file_size_uint32);
-        await write(1, "FPGA");
-        await writeRaw(1, file_size_uint32);
-        await writeRaw(1, crc32_uint32);
-        await writeRaw(1, bitstream);
-        console.log("Write done");
-    }
-}
-
-async function listen(ifIndex) {
-    let endpoint = interfaces[ifIndex].epIn;
-    console.log("Listening on ", endpoint.endpointNumber);
-    while (true) {
-        let result = await device.transferIn(endpoint.endpointNumber, endpoint.packetSize);
-        const decoder = new TextDecoder();
-        const message = decoder.decode(result.data);
-        //console.log(endpoint.endpointNumber, ":", message);
-        if (ifIndex == 0) {
-            terminal_debug.write(message);
-        } else if (ifIndex == 1) {
-            if (bitstream_state) {
-                bitstreamReceive(message);
-            } else {
-                terminal_esp32.write(message);
-            }
-        } else if (ifIndex == 2) {
-            terminal_fpga.write(message);
-        }
-    }
-}
-
-function write(ifIndex, data) {
-    let endpoint = interfaces[ifIndex].epOut;
-    var encoder = new TextEncoder();
-    return device.transferOut(endpoint.endpointNumber, encoder.encode(data));
-}
-
-async function writeRaw(ifIndex, data) {
-    let endpoint = interfaces[ifIndex].epOut;
-    for (let position = 0; position < data.byteLength; position += 1024) {
-        let part = data.slice(position, position + 1024);
-        console.log("Position", position);
-        await device.transferOut(endpoint.endpointNumber, part);
-        await new Promise(r => setTimeout(r, 50));
-    }
-}
-
-function fitTerm(terminal, id) {
-    //console.log("fitTerm", terminal, id);
-    let elem = document.getElementById(id);
-    let style = getComputedStyle(elem);
-    setTermSize(terminal, parseInt(style.width) - 10, parseInt(style.height) - 5);
-}
-
-function setTermSize(terminal, w, h) {
-    try {
-        terminal.resize(Math.floor(w / terminal._core._renderService.dimensions.actualCellWidth), Math.floor(h / terminal._core._renderService.dimensions.actualCellHeight));
-    } catch (error) {
-        // Ignore.
-    }
-}
-
-function addResizeListener(terminal, id) {
-    window.addEventListener('resize', fitTerm.bind(this, terminal, id));
-}
-
-var tabs = [];
-
-function selectTab(select) {
-    let buttons = "";
-    for (let index = 0; index < tabs.length; index++) {
-        let elem = document.getElementById(tabs[index].id);
-        elem.style.display = (index == select) ? "block" : "none";
-        buttons += "<button type='button' onclick='selectTab(" + index + ");' style='background-color: " + ((index == select) ? "#FFFF00" : "#FFFFFF") + ";'>" + tabs[index].label + "</button>"
-    }
-    document.getElementById("tabs").innerHTML = buttons;
-    
-    if (typeof tabs[select].onSelect === "function") {
-        tabs[select].onSelect();
-    }
-}
-
-function initTabs(newTabs) {
-    tabs = newTabs;
-    selectTab(0);
-}
-
-window.onload = () => {
-    terminal_debug = new Terminal();
-    terminal_debug.open(document.getElementById('terminal_debug'));
-    addResizeListener(terminal_debug, "terminal_debug");
-    terminal_debug.onData(data => {
-      write(0, data);
-    });
-    terminal_esp32 = new Terminal();
-    terminal_esp32.open(document.getElementById('terminal_esp32'));
-    addResizeListener(terminal_esp32, "terminal_esp32");
-    terminal_esp32.onData(data => {
-      write(1, data);
-    });
-    terminal_fpga = new Terminal();
-    terminal_fpga.open(document.getElementById('terminal_fpga'));
-    addResizeListener(terminal_fpga, "terminal_fpga");
-    terminal_fpga.onData(data => {
-      write(2, data);
-    });
-    
-    initTabs([
-        {id: "terminal_debug", label: "Terminal: Control (RP2040)", onSelect: fitTerm.bind(this, terminal_debug, "terminal_debug")},
-        {id: "terminal_esp32", label: "Terminal: CPU (ESP32)", onSelect: fitTerm.bind(this, terminal_esp32, "terminal_esp32")},
-        {id: "terminal_fpga", label: "Terminal: FPGA (ICE40)", onSelect: fitTerm.bind(this, terminal_fpga, "terminal_fpga")},
-        {id: "ui_webusb", label: "WebUSB UI", onSelect: () => {}},
-        {id: "ui_bitstream", label: "Bitstream UI", onSelect: () => {}},
-    ]);
-    
-    fitTerm(terminal_debug, "terminal_debug");
-    fitTerm(terminal_esp32, "terminal_esp32");
-    fitTerm(terminal_fpga, "terminal_fpga");
-    
-    onStart();
-    updateBitstreamUi();
-};

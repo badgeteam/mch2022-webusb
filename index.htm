@@ -12,21 +12,9 @@
 </head>
 
 <body>
-  <div class="box">
-    <div class="row header">
-      <strong>MCH2022</strong> WebUSB&nbsp;<span id="app">Javascript application is starting...</span><br />
-      <div id="tabs"></div>
-    </div>
-    <div class="row content" id="terminal_debug"></div>
-    <div class="row content" id="terminal_esp32"></div>
-    <div class="row content" id="ui_webusb"></div>
-    <div class="row content" id="ui_bitstream">
-      Status: <span id="ui_bitstream_status"></span><br />
-      <input type='file' id='bitstream_file'><button type='button' onclick='uploadBitstream();' id='ui_bitstream_btn' disabled>Upload</button>
-    </div>
-    <div class="row content" id="terminal_fpga"></div>
-  </div>
-  <script src="xterm.js"></script>
-  <script src="webusb.js"></script>
+<span id="app">Javascript application is starting...</span>
+<script src="crc32.js"></script>
+<script src="webusb.js"></script>
+<script src="app.js"></script>
 </body>
 </html>
