@@ -60,12 +60,18 @@ class Badge {
 
         this.on_connection_lost = null;
         this.on_disconnect = null;
+
+        this.connected = false;
     }
 
     _checkDeviceConnected() {
         if (this.device === null) {
             throw new Error("Not connected");
         }
+    }
+
+    is_connected() {
+        return (this.connected && this.device !== null);
     }
 
     async _findInterfaceIndex(firstInterfaceIndex = 0) {
@@ -207,7 +213,7 @@ class Badge {
                     return; // Wait for more data
                 }
             } else {
-                console.log("garbage", new DataView(this.data_buffer).getUint8(0));
+                //console.log("garbage", new DataView(this.data_buffer).getUint8(0));
                 this.data_buffer = this.data_buffer.slice(1); // Shift buffer
             }
         }
@@ -286,7 +292,7 @@ class Badge {
     }
 
     async connect() {
-        if (this.device !== null) {
+        if (this.is_connected()) {
             throw new Error("Already connected");
         }
         this.device = await navigator.usb.requestDevice({
@@ -319,10 +325,13 @@ class Badge {
         if (protocol_version < 2) {
             throw new Error("Protocol version not supported");
         }
+
+        this.connected = true;
     }
 
     async disconnect(reset = true) {
         this._checkDeviceConnected();
+        this.connected = false;
         try {
             this._stopListening();
             await this.controlSetMode(this.MODE_NORMAL);
@@ -555,7 +564,6 @@ class Badge {
         while (true) {
             let part = await this._transaction(this.PROTOCOL_COMMAND_TRANSFER_CHUNK, requested_size, 4000);
             if (part === null || part.byteLength < 1) break;
-            console.log("Read", part.byteLength);
             parts.push(part);
         }
         await this.filesystem_file_close(); // This also works on appfs "files"
@@ -565,8 +573,10 @@ class Badge {
     async app_write(name, title, version, data, progress_callback = null) {
         if (typeof name !== "string") throw new Error("Name should be a string");
         if (typeof title !== "string") throw new Error("Title should be a string");
-        if (typeof version !== "number") throw new Error("Version should be a number");
+        if (typeof version !== "number" || version === NaN) throw new Error("Version should be a number");
         if (!(data instanceof ArrayBuffer)) throw new Error("Data should be an ArrayBuffer");
+        if (name.length < 1 || name.length > 16) throw new Error("Name should be between 1 and 16 characters long");
+        if (title.length < 1 || title.length > 16) throw new Error("Title should be between 1 and 16 characters long");
         await this.sync_if_needed();
         let request = new Uint8Array(10 + name.length + title.length);
         let dataView = new DataView(request.buffer);
