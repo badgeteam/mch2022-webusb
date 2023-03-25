@@ -64,20 +64,20 @@ class Home {
                     let internal_total = Number(this.information.fs.internal.size);
                     let internal_used = internal_total - Number(this.information.fs.internal.free);
                     let internal_percentage = Math.round(internal_used * 100 / internal_total);
-                    internal_total = Math.round(internal_total / 100000) / 100;
-                    internal_used = Math.round(internal_used / 100000) / 100;
+                    internal_total = Math.round(internal_total / 100000) / 10;
+                    internal_used = Math.round(internal_used / 100000) / 10;
 
                     let sd_total = Number(this.information.fs.sd.size);
                     let sd_used = sd_total - Number(this.information.fs.sd.free);
                     let sd_percentage = Math.round(sd_used * 100 / sd_total);
-                    sd_total = Math.round(sd_total / 100000) / 100;
-                    sd_used = Math.round(sd_used / 100000) / 100;
+                    sd_total = Math.round(sd_total / 100000) / 10;
+                    sd_used = Math.round(sd_used / 100000) / 10;
 
                     let app_total = Number(this.information.fs.app.size);
                     let app_used = app_total - Number(this.information.fs.app.free);
                     let app_percentage = Math.round(app_used * 100 / app_total);
-                    app_total = Math.round(app_total / 100000) / 100;
-                    app_used = Math.round(app_used / 100000) / 100;
+                    app_total = Math.round(app_total / 100000) / 10;
+                    app_used = Math.round(app_used / 100000) / 10;
 
                     content.content[0][0].content.content.content.push({
                         type: "paragraph",
